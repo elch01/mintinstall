@@ -26,6 +26,7 @@ gi.require_version('XApp', '1.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GObject, GLib, Gio, XApp, Pango
 import cairo
 
+import xapp.os
 from mintcommon.installer import installer
 from mintcommon.installer import dialogs
 import prefs
@@ -648,6 +649,7 @@ class Application(Gtk.Application):
         self.installer = installer.Installer()
         self.installer.connect("appstream-changed", self.on_appstream_changed)
         self.task_cancellable = None
+        self.addons_cancellable = None
         self.current_task = None
         self.recursion_buster = False
 
@@ -951,6 +953,10 @@ class Application(Gtk.Application):
 
         self.addons_listbox = self.builder.get_object("box_addons")
         self.addons_listbox.set_header_func(list_header_func, None)
+
+        self.addons_page = self.builder.get_object("addons_page")
+        self.addons_content = self.builder.get_object("addons_content_frame")
+        self.addons_spinner = self.builder.get_object("addons_spinner")
         self.package_details_listbox = self.builder.get_object("package_details_listbox")
 
         self.app_list_stack = self.builder.get_object("app_list_stack")
@@ -2300,11 +2306,20 @@ class Application(Gtk.Application):
         XApp.set_window_progress(self.main_window, 0)
         self.stop_progress_pulse()
 
+        if self.addons_cancellable is not None:
+            self.addons_cancellable.cancel()
+            self.addons_cancellable = None
+            self.addons_spinner.stop()
+
         # If we're still loading details (and simulating), there's no task yet,
         # but we can cancel it via cancellable the installer gave us initially.
         if self.task_cancellable is not None:
             self.task_cancellable.cancel()
             self.task_cancellable = None
+
+        if self.search_idle_timer > 0:
+            GLib.source_remove(self.search_idle_timer)
+            self.search_idle_timer = 0
 
         # If we have a task, we're viewing a package and it's been 'loaded' fully.
         # Cancel it directly.
@@ -2496,7 +2511,7 @@ class Application(Gtk.Application):
                     is_match = True
                     pkginfo.search_tier = 100
                     break
-                if(search_in_description and termsUpper in self.installer.get_description(pkginfo).upper()):
+                if(search_in_description and termsUpper in self.installer.get_description(pkginfo, for_search=True).upper()):
                     is_match = True
                     pkginfo.search_tier = 200
                     break
@@ -3181,25 +3196,51 @@ class Application(Gtk.Application):
             self.launch_button.hide()
 
     def populate_addons(self, pkginfo):
+        if self.addons_cancellable is not None:
+            self.addons_cancellable.cancel()
+        self.addons_cancellable = Gio.Cancellable()
+
         for row in self.addons_listbox.get_children():
             row.destroy()
 
+        self.addons_content.hide()
+        self.addons_spinner.show()
+        self.addons_spinner.start()
+        self.addons_page.show()
+
+        thread = threading.Thread(
+            target=self._populate_addons_thread,
+            args=(pkginfo, self.addons_cancellable),
+            daemon=True,
+        )
+        thread.start()
+
+    def _populate_addons_thread(self, pkginfo, cancellable):
         addons = self.installer.get_addons(pkginfo)
-        if addons is None:
-            self.builder.get_object("addons_page").hide()
-            return
+        if addons:
+            addons.sort(key=lambda a: a.get_display_name().casefold())
+        GLib.idle_add(self._populate_addons_finished, pkginfo, addons, cancellable)
+
+    def _populate_addons_finished(self, pkginfo, addons, cancellable):
+        if cancellable.is_cancelled():
+            return False
+
+        self.addons_spinner.stop()
+        self.addons_spinner.hide()
+
+        if not addons:
+            self.addons_page.hide()
+            return False
 
         name_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
         button_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
 
-        first = True
         for addon in addons:
-            print("Discovered addon: %s" % addon.name)
-            first = False
-
             row = FlatpakAddonRow(self, pkginfo, addon, name_size_group, button_size_group)
             self.addons_listbox.insert(row, -1)
-            self.builder.get_object("addons_page").show_all()
+
+        self.addons_content.show_all()
+        return False
 
     def on_installer_progress(self, pkginfo, progress, estimating, status_text=None):
         if self.current_pkginfo is not None and self.current_pkginfo.name == pkginfo.name:
@@ -3293,8 +3334,12 @@ class DottedProgressLabel(Gtk.Fixed):
         self.move(self.label, x_offset, 0)
 
 if __name__ == "__main__":
-    os.system("mkdir -p %s" % imaging.SCREENSHOT_DIR)
+    try:
+        xapp.os.add_network_proxy_to_env()
+    except Exception as e:
+        print("Network proxy support unavailable: %s", str(e))
 
+    os.system("mkdir -p %s" % imaging.SCREENSHOT_DIR)
     if os.environ.get("RAYON_NUM_THREADS") is None:
         os.environ["RAYON_NUM_THREADS"] = "2"
 
